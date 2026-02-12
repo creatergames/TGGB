@@ -1,0 +1,4 @@
+requests
+Pillow
+python-dotenv
+flask
