@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
 
-# --- ИНИЦИАЛИЗАЦИЯ ---
+# --- ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКИ ---
 load_dotenv()
 app = Flask('')
 
@@ -18,7 +18,7 @@ user_keys = {}
 
 @app.route('/')
 def home():
-    return "🚀 Бот ГДЗ 2026: Работаю стабильно | BYOK Mode"
+    return "🤖 GDZ System Status: 24/7 ONLINE | Mode: Advanced BYOK"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
@@ -28,12 +28,177 @@ def log(message):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {message}")
 
-# --- КЛАСС БОТА ---
-class UltimateGdzBot:
+# --- ОСНОВНОЙ КЛАСС БОТА ---
+class UltraMasterBot:
     def __init__(self):
-        log("⚙️ [INIT] Сборка без ошибок отступов...")
+        log("⚙️ [START] Сборка бота со всеми функциями...")
         self.tg_token = os.getenv("TELEGRAM_TOKEN")
         self.admin_key = os.getenv("GEMINI_API_KEY") 
+        self.tg_url = f"https://api.telegram.org/bot{self.tg_token}/"
+        # Самая мощная модель для 2026 года
+        self.model_name = "models/gemini-2.0-flash" 
+        self.offset = 0
+        self.session = requests.Session()
+        
+        # 10 идей внедрены в этот промпт
+        self.system_instructions = (
+            "Ты — элитный ИИ-репетитор. Твои правила:\n"
+            "1. Решай всё по фото (текст, формулы, почерк).\n"
+            "2. Формат: **Дано**, **Решение**, **Ответ**.\n"
+            "3. Режим ЕГЭ: давай подсказки по правильному оформлению.\n"
+            "4. В конце пиши '🎥 Рекомендую темы для YouTube: ...' (идея №8).\n"
+            "5. Используй LaTeX символы и жирный шрифт для scannability.\n"
+            "6. Объясняй логику решения максимально понятно."
+        )
+
+    def get_main_keyboard(self):
+        """Интерактивное меню под сообщениями"""
+        return {
+            "inline_keyboard": [
+                [{"text": "📚 Объясни проще", "callback_data": "mode_simple"}, 
+                 {"text": "📝 Режим ЕГЭ/ОГЭ", "callback_data": "mode_ege"}],
+                [{"text": "🔑 Добавить свой ключ", "callback_data": "tutorial"},
+                 {"text": "🇬🇧 На английский", "callback_data": "mode_en"}]
+            ]
+        }
+
+    def call_gemini_ai(self, text, img_bytes=None, user_id=None, sub_mode="standard"):
+        """Ядро ИИ с поддержкой личных ключей и ротации"""
+        # Используем личный ключ юзера или основной админский
+        active_key = user_keys.get(user_id, self.admin_key)
+        
+        instruction = self.system_instructions
+        if sub_mode == "mode_simple": instruction += "\nМаксимально упрости объяснение."
+        elif sub_mode == "mode_ege": instruction += "\nОформи строго по критериям госэкзаменов."
+        elif sub_mode == "mode_en": instruction += "\nПереведи всё решение на английский язык."
+
+        parts = [{"text": f"{instruction}\n\nЗАДАЧА: {text}"}]
+        if img_bytes:
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img_bytes).decode()}})
+        
+        payload = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.3}}
+        api_url = f"https://generativelanguage.googleapis.com/v1/{self.model_name}:generateContent?key={active_key}"
+
+        try:
+            r = self.session.post(api_url, json=payload, timeout=90)
+            if r.status_code == 429:
+                return "LIMIT_ERROR"
+            if r.status_code != 200:
+                return "ERROR"
+            return r.json()['candidates'][0]['content']['parts'][0]['text']
+        except Exception as e:
+            log(f"🛑 [AI ERROR] {e}")
+            return "ERROR"
+
+    def send_smart_message(self, chat_id, text, with_kb=True):
+        """Разбивка длинных сообщений (идея №7) и отправка"""
+        limit = 3800
+        text_parts = [text[i:i + limit] for i in range(0, len(text), limit)]
+        
+        for i, part in enumerate(text_parts):
+            is_last_part = (i == len(text_parts) - 1)
+            payload = {
+                "chat_id": chat_id,
+                "text": part,
+                "parse_mode": "Markdown",
+                "reply_markup": self.get_main_keyboard() if (is_last_part and with_kb) else None
+            }
+            try:
+                self.session.post(self.tg_url + "sendMessage", json=payload, timeout=30)
+            except:
+                # Если Markdown вызвал ошибку, шлем чистым текстом
+                payload.pop("parse_mode", None)
+                self.session.post(self.tg_url + "sendMessage", json=payload, timeout=30)
+
+    def run_polling(self):
+        log("🛰 [READY] Бот начал опрос Telegram...")
+        while True:
+            try:
+                res = self.session.get(self.tg_url + "getUpdates", params={"offset": self.offset, "timeout": 20}).json()
+                for upd in res.get("result", []):
+                    self.offset = upd["update_id"] + 1
+                    
+                    # 1. ОБРАБОТКА КНОПОК
+                    if "callback_query" in upd:
+                        cq = upd["callback_query"]
+                        uid = cq["message"]["chat"]["id"]
+                        self.session.post(self.tg_url + "answerCallbackQuery", json={"callback_query_id": cq["id"]})
+                        
+                        if cq["data"] == "tutorial":
+                            t_msg = ("🔑 **ИНСТРУКЦИЯ ПО КЛЮЧУ**\n\n"
+                                     "1. Зайди на [Google AI Studio](https://aistudio.google.com/app/apikey)\n"
+                                     "2. Нажми **'Create API key'**\n"
+                                     "3. Пришли скопированный ключ мне (начинается на AIza).\n\n"
+                                     "Это даст тебе **полный безлимит**!")
+                            self.send_smart_message(uid, t_msg, with_kb=False)
+                        else:
+                            log(f"🔘 Кнопка: {cq['data']} от {uid}")
+                            new_ans = self.call_gemini_ai("Переработай ответ в этом режиме", user_id=uid, sub_mode=cq["data"])
+                            self.send_smart_message(uid, "🔄 **ОБНОВЛЕННОЕ РЕШЕНИЕ:**\n\n" + new_ans)
+                        continue
+
+                    msg = upd.get("message")
+                    if not msg or "chat" not in msg: continue
+                    chat_id = msg["chat"]["id"]
+                    u_text = msg.get("text", "")
+
+                    # 2. ПРИВЕТСТВИЕ (Идея №2)
+                    if u_text == "/start":
+                        welcome = ("👋 **Привет! Я твой элитный ГДЗ-бот 2026.**\n\n"
+                                   "📸 Просто пришли мне **фото задачи** или напиши её текстом.\n\n"
+                                   "✨ Я умею:\n"
+                                   "• Решать математику, физику, химию\n"
+                                   "• Разбирать рукописный почерк\n"
+                                   "• Объяснять сложные темы\n"
+                                   "• Давать советы для ЕГЭ")
+                        self.send_smart_message(chat_id, welcome, with_kb=False)
+                        continue
+
+                    # 3. ПРИЕМ ЛИЧНОГО КЛЮЧА
+                    if u_text.strip().startswith("AIza"):
+                        user_keys[chat_id] = u_text.strip()
+                        log(f"🔑 Пользователь {chat_id} добавил свой ключ.")
+                        self.send_smart_message(chat_id, "✅ **Ключ принят!** Теперь для тебя действуют твои персональные лимиты.", with_kb=False)
+                        continue
+
+                    # 4. ОБРАБОТКА ФОТО (Идея №10 - сжатие)
+                    img_data = None
+                    if "photo" in msg:
+                        log(f"📸 Фото от {chat_id}")
+                        fid = msg["photo"][-1]["file_id"]
+                        fpath = self.session.get(self.tg_url + "getFile", params={"file_id": fid}).json()["result"]["file_path"]
+                        raw_img = self.session.get(f"https://api.telegram.org/file/bot{self.tg_token}/{fpath}").content
+                        
+                        img = Image.open(io.BytesIO(raw_img)).convert('RGB')
+                        img.thumbnail((1600, 1600))
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=85)
+                        img_data = buf.getvalue()
+
+                    # 5. ГЕНЕРАЦИЯ ОТВЕТА
+                    prompt = msg.get("text", msg.get("caption", "Реши задачу на фото"))
+                    self.session.post(self.tg_url + "sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+                    
+                    ans = self.call_gemini_ai(prompt, img_data, user_id=chat_id)
+
+                    # 6. ВЫХОД ПРИ ЗАКОНЧИВШИХСЯ ЛИМИТАХ
+                    if ans == "LIMIT_ERROR":
+                        l_msg = ("⚠️ **Лимиты бота исчерпаны!**\n\n"
+                                 "Сегодня было слишком много задач. Чтобы продолжить прямо сейчас, "
+                                 "добавь **свой личный ключ** (это бесплатно). Нажми кнопку ниже для инструкции.")
+                        self.send_smart_message(chat_id, l_msg, with_kb=True)
+                    elif ans == "ERROR":
+                        self.send_smart_message(chat_id, "❌ Ошибка. Попробуй другое фото.", with_kb=False)
+                    else:
+                        self.send_smart_message(chat_id, ans)
+
+            except Exception as e:
+                log(f"🛑 [CRITICAL] {e}")
+                time.sleep(5)
+
+if __name__ == "__main__":
+    Thread(target=run_web, daemon=True).start()
+    UltraMasterBot().run_polling()
         self.tg_url = f"https://api.telegram.org/bot{self.tg_token}/"
         self.model_name = "models/gemini-2.0-flash" 
         self.offset = 0
