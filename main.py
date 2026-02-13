@@ -4,36 +4,174 @@ import requests
 import base64
 import io
 import datetime
+import sqlite3
 from PIL import Image
 from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
 
-# --- БЛОК ОЖИВЛЕНИЯ 24/7 ---
+# --- ИНИЦИАЛИЗАЦИЯ БД (Идея: База знаний) ---
+def init_db():
+    conn = sqlite3.connect('solutions_cache.db')
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS cache 
+                      (hash TEXT PRIMARY KEY, solution TEXT)''')
+    conn.commit()
+    conn.close()
+
+# --- СЕРВЕР 24/7 ---
 app = Flask('')
 @app.route('/')
-def home(): return "Бот ГДЗ: Ротация 10 ключей активна"
+def home(): return "🤖 ГДЗ Ультра-Бот: Статус 24/7 Online"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-def keep_alive():
-    log("🌐 Запуск веб-сервера для Render/UptimeRobot...")
-    Thread(target=run_web, daemon=True).start()
-
-# --- СИСТЕМА ЛОГИРОВАНИЯ ---
+# --- ЛОГИРОВАНИЕ ---
 def log(message):
-    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] {message}")
+    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}")
 
 # --- ОСНОВНОЙ КЛАСС БОТА ---
 load_dotenv()
 
-class MultiKeyGdzBot:
+class UltimateGdzBot:
     def __init__(self):
+        log("🚀 Запуск Максимальной версии бота...")
         self.tg_token = os.getenv("TELEGRAM_TOKEN")
-        # Получаем список ключей из одной переменной, разделенной запятыми
+        raw_keys = os.getenv("GEMINI_API_KEYS", "")
+        self.keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        
+        self.current_key_idx = 0
+        self.tg_url = f"https://api.telegram.org/bot{self.tg_token}/"
+        self.model_name = "models/gemini-1.5-flash"
+        self.offset = 0
+        self.session = requests.Session()
+        
+        # РАСШИРЕННЫЙ ПРОМПТ (Идеи: Почерк, ЕГЭ, Видео-ссылки, Уровни сложности)
+        self.system_instructions = (
+            "Ты — универсальный ИИ-репетитор. Твои возможности:\n"
+            "1. Анализ фото (даже плохой почерк).\n"
+            "2. Решение задач по ГОСТу (Дано, Решение, Ответ).\n"
+            "3. Режим ЕГЭ/ОГЭ: давай советы по оформлению для экспертов.\n"
+            "4. Объясняй сложные темы простыми словами.\n"
+            "5. Предлагай темы для поиска на YouTube для закрепления.\n"
+            "6. Пиши формулы четко. В конце делай вывод: 'Правило, которое мы применили'."
+        )
+        init_db()
+
+    def send_tg(self, method, payload):
+        try:
+            return self.session.post(self.tg_url + method, json=payload, timeout=30).json()
+        except Exception as e:
+            log(f"❌ Ошибка TG API: {e}")
+            return None
+
+    def get_main_keyboard(self):
+        """Создание кнопок под сообщением (Идея: Интерфейс)"""
+        return {
+            "inline_keyboard": [
+                [{"text": "📚 Объясни проще", "callback_data": "explain_simple"}, 
+                 {"text": "📝 Как на ЕГЭ", "callback_data": "ege_style"}],
+                [{"text": "🇬🇧 На английский", "callback_data": "translate_en"},
+                 {"text": "🎬 Видео-урок", "callback_data": "yt_search"}]
+            ]
+        }
+
+    def call_gemini(self, text, img_bytes=None, mode="standard"):
+        """Запрос к ИИ с ротацией ключей"""
+        # Модификация промпта в зависимости от режима
+        mode_prefix = ""
+        if mode == "explain_simple": mode_prefix = "ОБЪЯСНИ КАК РЕБЕНКУ: "
+        elif mode == "ege_style": mode_prefix = "ОФОРМИ ПО КРИТЕРИЯМ ЕГЭ: "
+
+        parts = [{"text": f"{self.system_instructions}\n\n{mode_prefix}ЗАДАЧА: {text}"}]
+        if img_bytes:
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img_bytes).decode()}})
+        
+        payload = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.5}}
+
+        for _ in range(len(self.keys)):
+            log(f"📡 Запрос ИИ (Ключ {self.current_key_idx + 1})")
+            api_url = f"https://generativelanguage.googleapis.com/v1/{self.model_name}:generateContent?key={self.keys[self.current_key_idx]}"
+            try:
+                r = self.session.post(api_url, json=payload, timeout=90)
+                if r.status_code == 429:
+                    self.current_key_idx = (self.current_key_idx + 1) % len(self.keys)
+                    continue
+                return r.json()['candidates'][0]['content']['parts'][0]['text']
+            except:
+                self.current_key_idx = (self.current_key_idx + 1) % len(self.keys)
+        return "❌ Лимиты всех ключей временно исчерпаны."
+
+    def send_solution(self, chat_id, text):
+        """Разбивка и отправка решения (Сохранение функции деления)"""
+        limit = 3800
+        parts = [text[i:i + limit] for i in range(0, len(text), limit)]
+        for i, part in enumerate(parts):
+            msg_payload = {
+                "chat_id": chat_id,
+                "text": f"✨ **ЧАСТЬ {i+1}/{len(parts)}**\n\n{part}" if len(parts)>1 else part,
+                "parse_mode": "Markdown",
+                "reply_markup": self.get_main_keyboard() if i == len(parts)-1 else None
+            }
+            self.send_tg("sendMessage", msg_payload)
+
+    def run(self):
+        log("🛰 Бот активен и готов к работе...")
+        while True:
+            try:
+                updates = self.send_tg("getUpdates", {"offset": self.offset, "timeout": 20})
+                if not updates or "result" not in updates: continue
+
+                for upd in updates["result"]:
+                    self.offset = upd["update_id"] + 1
+                    
+                    # Обработка нажатий на кнопки (Идея: Интерактив)
+                    if "callback_query" in upd:
+                        query = upd["callback_query"]
+                        chat_id = query["message"]["chat"]["id"]
+                        mode = query["data"]
+                        self.send_tg("answerCallbackQuery", {"callback_query_id": query["id"], "text": "Обработка..."})
+                        ans = self.call_gemini("Повтори прошлое решение, но в режиме: " + mode)
+                        self.send_solution(chat_id, "🔄 **ОБНОВЛЕННЫЙ ВАРИАНТ:**\n\n" + ans)
+                        continue
+
+                    msg = upd.get("message")
+                    if not msg or "chat" not in msg: continue
+                    chat_id = msg["chat"]["id"]
+
+                    # Обработка Фото/Текста
+                    img_data = None
+                    if "photo" in msg:
+                        log(f"📸 Загрузка фото от {chat_id}")
+                        file_id = msg["photo"][-1]["file_id"]
+                        f_info = self.send_tg("getFile", {"file_id": file_id})
+                        f_path = f_info["result"]["file_path"]
+                        img_raw = self.session.get(f"https://api.telegram.org/file/bot{self.tg_token}/{f_path}").content
+                        
+                        img = Image.open(io.BytesIO(img_raw)).convert('RGB')
+                        img.thumbnail((1600, 1600))
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=85)
+                        img_data = buf.getvalue()
+
+                    user_prompt = msg.get("text", msg.get("caption", "Реши задачу"))
+                    if user_prompt == "/start":
+                        self.send_tg("sendMessage", {"chat_id": chat_id, "text": "👋 Привет! Пришли фото задачи, и я решу её по всем правилам!"})
+                        continue
+
+                    self.send_tg("sendChatAction", {"chat_id": chat_id, "action": "typing"})
+                    solution = self.call_gemini(user_prompt, img_data)
+                    self.send_solution(chat_id, solution)
+                            
+            except Exception as e:
+                log(f"⚠️ Ошибка: {e}")
+                time.sleep(5)
+
+if __name__ == "__main__":
+    Thread(target=run_web, daemon=True).start()
+    UltimateGdzBot().run()
         raw_keys = os.getenv("GEMINI_API_KEYS", "")
         self.gemini_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
         
