@@ -13,27 +13,153 @@ from threading import Thread
 load_dotenv()
 app = Flask('')
 
-# Хранилище личных ключей (в оперативной памяти)
+# Хранилище личных ключей
 user_keys = {}
 
 @app.route('/')
 def home():
-    return "🤖 GDZ System: ONLINE | Model: Gemini 2.5 Flash | BYOK: Active"
+    # Мгновенный ответ для Health Check Render
+    return "🚀 Бот онлайн. Деплой успешен!"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
+    # Передача host='0.0.0.0' критична для Render
     app.run(host='0.0.0.0', port=port)
 
 def log(message):
     ts = datetime.datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {message}")
 
-# --- КЛАСС БОТА ---
+# --- КЛАСС БОТА (БЕЗ ОШИБОК ОТСТУПОВ) ---
 class UltraGdzBot:
     def __init__(self):
-        log("⚙️ [INIT] Сборка бота...")
+        log("⚙️ Сборка системы...")
         self.tg_token = os.getenv("TELEGRAM_TOKEN")
         self.admin_key = os.getenv("GEMINI_API_KEY") 
+        self.tg_url = f"https://api.telegram.org/bot{self.tg_token}/"
+        self.model_name = "models/gemini-2.0-flash" 
+        self.offset = 0
+        self.session = requests.Session()
+        
+        self.system_instructions = (
+            "Ты — элитный ИИ-репетитор. Решай всё по фото.\n"
+            "Формат: **Дано**, **Решение**, **Ответ**.\n"
+            "Добавляй советы для ЕГЭ и YouTube темы."
+        )
+
+    def get_keyboard(self):
+        return {
+            "inline_keyboard": [
+                [{"text": "📚 Проще", "callback_data": "mode_simple"}, 
+                 {"text": "📝 ЕГЭ", "callback_data": "mode_ege"}],
+                [{"text": "🔑 Свой ключ", "callback_data": "tutorial"}]
+            ]
+        }
+
+    def call_ai(self, text, img_bytes=None, user_id=None, sub_mode="standard"):
+        active_key = user_keys.get(user_id, self.admin_key)
+        
+        instruction = self.system_instructions
+        if sub_mode == "mode_simple": instruction += "\nУпрости объяснение."
+        elif sub_mode == "mode_ege": instruction += "\nОформи по критериям ЕГЭ."
+
+        parts = [{"text": f"{instruction}\n\nЗАДАЧА: {text}"}]
+        if img_bytes:
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img_bytes).decode()}})
+        
+        payload = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.3}}
+        api_url = f"https://generativelanguage.googleapis.com/v1/{self.model_name}:generateContent?key={active_key}"
+
+        try:
+            r = self.session.post(api_url, json=payload, timeout=90)
+            if r.status_code == 429: return "LIMIT_ERROR"
+            return r.json()['candidates'][0]['content']['parts'][0]['text']
+        except:
+            return "ERROR"
+
+    def send_smart_msg(self, chat_id, text, with_kb=True):
+        limit = 3800
+        parts = [text[i:i + limit] for i in range(0, len(text), limit)]
+        for i, part in enumerate(parts):
+            is_last = (i == len(parts) - 1)
+            payload = {
+                "chat_id": chat_id,
+                "text": part,
+                "parse_mode": "Markdown",
+                "reply_markup": self.get_keyboard() if (is_last and with_kb) else None
+            }
+            try:
+                self.session.post(self.tg_url + "sendMessage", json=payload)
+            except:
+                payload.pop("parse_mode", None)
+                self.session.post(self.tg_url + "sendMessage", json=payload)
+
+    def run(self):
+        log("🛰 Бот активен...")
+        while True:
+            try:
+                r = self.session.get(self.tg_url + "getUpdates", params={"offset": self.offset, "timeout": 20}).json()
+                for upd in r.get("result", []):
+                    self.offset = upd["update_id"] + 1
+                    
+                    if "callback_query" in upd:
+                        cb = upd["callback_query"]
+                        uid = cb["message"]["chat"]["id"]
+                        self.session.post(self.tg_url + "answerCallbackQuery", json={"callback_query_id": cb["id"]})
+                        
+                        if cb["data"] == "tutorial":
+                            self.send_smart_msg(uid, "🔑 Пришли свой API Key от Google AI Studio.", with_kb=False)
+                        else:
+                            res = self.call_ai("Обнови решение", user_id=uid, sub_mode=cb["data"])
+                            self.send_smart_msg(uid, "🔄 **ОБНОВЛЕНИЕ:**\n\n" + res)
+                        continue
+
+                    msg = upd.get("message")
+                    if not msg: continue
+                    chat_id = msg["chat"]["id"]
+                    text = msg.get("text", "")
+
+                    if text == "/start":
+                        self.send_smart_msg(chat_id, "👋 Привет! Пришли фото задачи.", with_kb=False)
+                        continue
+
+                    if text.strip().startswith("AIza"):
+                        user_keys[chat_id] = text.strip()
+                        self.send_smart_msg(chat_id, "✅ Ключ привязан!", with_kb=False)
+                        continue
+
+                    img_data = None
+                    if "photo" in msg:
+                        fid = msg["photo"][-1]["file_id"]
+                        f_info = self.session.get(self.tg_url + "getFile", params={"file_id": fid}).json()
+                        raw = self.session.get(f"https://api.telegram.org/file/bot{self.tg_token}/{f_info['result']['file_path']}").content
+                        img = Image.open(io.BytesIO(raw)).convert('RGB')
+                        img.thumbnail((1600, 1600))
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=85)
+                        img_data = buf.getvalue()
+
+                    prmpt = msg.get("text", msg.get("caption", "Реши задачу"))
+                    self.session.post(self.tg_url + "sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+                    ans = self.call_ai(prmpt, img_data, user_id=chat_id)
+
+                    if ans == "LIMIT_ERROR":
+                        self.send_smart_msg(chat_id, "⚠️ Лимиты исчерпаны. Добавь свой ключ!", with_kb=True)
+                    elif ans == "ERROR":
+                        self.send_smart_msg(chat_id, "❌ Ошибка. Попробуй еще раз.", with_kb=False)
+                    else:
+                        self.send_smart_msg(chat_id, ans)
+
+            except Exception as e:
+                log(f"🛑 Ошибка: {e}")
+                time.sleep(5)
+
+# --- ЗАПУСК ---
+if __name__ == "__main__":
+    # Сначала запускаем веб-сервер, чтобы Render увидел активный порт
+    Thread(target=run_web, daemon=True).start()
+    # Затем запускаем основного бота
+    UltraGdzBot().run()
         self.tg_url = f"https://api.telegram.org/bot{self.tg_token}/"
         self.model_name = "models/gemini-2.0-flash" 
         self.offset = 0
