@@ -10,30 +10,182 @@ from dotenv import load_dotenv
 from flask import Flask
 from threading import Thread
 
-# --- ИНИЦИАЛИЗАЦИЯ БД (Идея: База знаний) ---
+# --- ИНИЦИАЛИЗАЦИЯ КЭША ---
 def init_db():
-    conn = sqlite3.connect('solutions_cache.db')
-    cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS cache 
-                      (hash TEXT PRIMARY KEY, solution TEXT)''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect('solutions_cache.db')
+        cursor = conn.cursor()
+        cursor.execute('''CREATE TABLE IF NOT EXISTS cache 
+                          (hash TEXT PRIMARY KEY, solution TEXT)''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB Error: {e}")
 
-# --- СЕРВЕР 24/7 ---
+# --- WEB СЕРВЕР ДЛЯ RENDER ---
 app = Flask('')
 @app.route('/')
-def home(): return "🤖 ГДЗ Ультра-Бот: Статус 24/7 Online"
+def home():
+    return "🤖 GDZ Bot Status: ACTIVE | Logging: ENABLED"
 
 def run_web():
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port)
 
-# --- ЛОГИРОВАНИЕ ---
-def log(message):
-    print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}")
+def keep_alive():
+    log("🌐 [WEB] Запуск мониторинга...")
+    Thread(target=run_web, daemon=True).start()
 
-# --- ОСНОВНОЙ КЛАСС БОТА ---
+# --- СИСТЕМА ЛОГОВ ---
+def log(message):
+    ts = datetime.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {message}")
+
+# --- ГЛАВНЫЙ КЛАСС БОТА ---
 load_dotenv()
+
+class MegaGdzBot:
+    def __init__(self):
+        log("⚙️ [INIT] Сборка системы...")
+        self.tg_token = os.getenv("TELEGRAM_TOKEN")
+        raw_keys = os.getenv("GEMINI_API_KEYS", "")
+        self.keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        
+        self.current_key_idx = 0
+        self.tg_url = f"https://api.telegram.org/bot{self.tg_token}/"
+        # Возвращена прошлая модель по запросу
+        self.model_name = "models/gemini-1.5-flash"
+        self.offset = 0
+        self.session = requests.Session()
+        
+        self.system_prompt = (
+            "Ты — универсальный ИИ-репетитор. Твои задачи:\n"
+            "1. Решай задачи по фото (даже рукописные).\n"
+            "2. Структура: **Дано**, **Решение**, **Ответ**.\n"
+            "3. Режим ЕГЭ/ОГЭ: давай советы по оформлению.\n"
+            "4. Объясняй сложные темы просто.\n"
+            "5. Предлагай темы для YouTube в конце.\n"
+            "6. Пиши формулы четко через Markdown."
+        )
+        init_db()
+        log(f"✅ [INIT] Готово. Ключей: {len(self.keys)}")
+
+    def get_keyboard(self):
+        """Интерактивное меню под ответом"""
+        return {
+            "inline_keyboard": [
+                [{"text": "📚 Объясни проще", "callback_data": "simple"}, 
+                 {"text": "📝 Режим ЕГЭ", "callback_data": "ege"}],
+                [{"text": "🇬🇧 На английский", "callback_data": "en"},
+                 {"text": "🎬 Видео-урок", "callback_data": "yt"}]
+            ]
+        }
+
+    def call_gemini(self, text, img_bytes=None, mode="standard"):
+        """Запрос к ИИ с ротацией ключей и логированием"""
+        prefix = ""
+        if mode == "simple": prefix = "ОБЪЯСНИ КАК РЕБЕНКУ: "
+        elif mode == "ege": prefix = "ОФОРМИ ПО КРИТЕРИЯМ ЕГЭ: "
+
+        parts = [{"text": f"{self.system_prompt}\n\n{prefix}ЗАДАЧА: {text}"}]
+        if img_bytes:
+            log("🖼 [AI] Обработка изображения...")
+            parts.append({"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(img_bytes).decode()}})
+        
+        payload = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.4}}
+
+        for attempt in range(len(self.keys)):
+            log(f"📡 [AI] Запрос (Ключ {self.current_key_idx + 1})")
+            api_url = f"https://generativelanguage.googleapis.com/v1/{self.model_name}:generateContent?key={self.keys[self.current_key_idx]}"
+            try:
+                r = self.session.post(api_url, json=payload, timeout=90)
+                if r.status_code == 429:
+                    log(f"⏳ [AI] Ключ {self.current_key_idx + 1} исчерпан. Ротация...")
+                    self.current_key_idx = (self.current_key_idx + 1) % len(self.keys)
+                    continue
+                
+                res_json = r.json()
+                return res_json['candidates'][0]['content']['parts'][0]['text']
+            except Exception as e:
+                log(f"💥 [AI] Ошибка ключа {self.current_key_idx + 1}: {e}")
+                self.current_key_idx = (self.current_key_idx + 1) % len(self.keys)
+                time.sleep(1)
+        
+        return "❌ Все лимиты исчерпаны. Попробуйте позже."
+
+    def send_split_message(self, chat_id, text, with_kb=True):
+        """Деление сообщения и отправка с кнопками"""
+        log(f"📦 [SEND] Подготовка ответа для {chat_id}")
+        limit = 3800
+        parts = [text[i:i + limit] for i in range(0, len(text), limit)]
+        
+        for idx, part in enumerate(parts):
+            is_last = (idx == len(parts) - 1)
+            payload = {
+                "chat_id": chat_id,
+                "text": part,
+                "parse_mode": "Markdown",
+                "reply_markup": self.get_keyboard() if (is_last and with_kb) else None
+            }
+            try:
+                self.session.post(self.tg_url + "sendMessage", json=payload, timeout=30)
+                log(f"📤 [SEND] Часть {idx+1}/{len(parts)} отправлена.")
+            except Exception as e:
+                log(f"❌ [SEND] Ошибка отправки: {e}")
+
+    def run(self):
+        log("🛰 [SYS] Бот слушает Telegram...")
+        while True:
+            try:
+                r = self.session.get(self.tg_url + "getUpdates", params={"offset": self.offset, "timeout": 20}, timeout=30)
+                updates = r.json().get("result", [])
+
+                for upd in updates:
+                    self.offset = upd["update_id"] + 1
+                    
+                    if "callback_query" in upd:
+                        log("🔘 [BTN] Нажата кнопка меню.")
+                        cb = upd["callback_query"]
+                        self.session.post(self.tg_url + "answerCallbackQuery", json={"callback_query_id": cb["id"]})
+                        new_ans = self.call_gemini("Переделай прошлое решение в режиме: " + cb["data"])
+                        self.send_split_message(cb["message"]["chat"]["id"], "🔄 **ОБНОВЛЕННОЕ РЕШЕНИЕ:**\n\n" + new_ans)
+                        continue
+
+                    msg = upd.get("message")
+                    if not msg or "chat" not in msg: continue
+                    chat_id = msg["chat"]["id"]
+                    
+                    self.session.post(self.tg_url + "sendChatAction", json={"chat_id": chat_id, "action": "typing"})
+
+                    img_data = None
+                    if "photo" in msg:
+                        log(f"📸 [FILE] Получено фото от {chat_id}")
+                        file_id = msg["photo"][-1]["file_id"]
+                        f_info = self.session.get(self.tg_url + "getFile", params={"file_id": file_id}).json()
+                        raw_img = self.session.get(f"https://api.telegram.org/file/bot{self.tg_token}/{f_info['result']['file_path']}").content
+                        
+                        img = Image.open(io.BytesIO(raw_img)).convert('RGB')
+                        img.thumbnail((1600, 1600))
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=85)
+                        img_data = buf.getvalue()
+
+                    prompt = msg.get("text", msg.get("caption", "Реши задачу"))
+                    if prompt == "/start":
+                        self.send_split_message(chat_id, "📚 Привет! Пришли фото или текст задачи, и я решу её!", with_kb=False)
+                        continue
+
+                    log(f"💬 [USER] Запрос: {prompt[:50]}...")
+                    ans = self.call_gemini(prompt, img_data)
+                    self.send_split_message(chat_id, ans)
+                            
+            except Exception as e:
+                log(f"🛑 [ERR] Критическая ошибка: {e}")
+                time.sleep(5)
+
+if __name__ == "__main__":
+    keep_alive()
+    MegaGdzBot().run()
 
 class UltimateGdzBot:
     def __init__(self):
